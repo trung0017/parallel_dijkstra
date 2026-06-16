@@ -1,0 +1,33 @@
+name: MPI Dijkstra CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build-and-run:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install MPI Library
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y openmpi-bin libopenmpi-dev
+
+    - name: Compile MPI Project (CI Mode)
+      run: |
+        # Biên dịch phiên bản giảm tải để hoàn thành kiểm thử nhanh chóng
+        make ci-build
+
+    - name: Run Dijkstra Verification (NP = 2)
+      run: |
+        mpirun --oversubscribe -np 2 ./parallel_dijkstra_opt
+
+    - name: Run Dijkstra Verification (NP = 4)
+      run: |
+        mpirun --oversubscribe -np 4 ./parallel_dijkstra_opt
