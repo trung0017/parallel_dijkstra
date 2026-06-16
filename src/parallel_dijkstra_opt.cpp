@@ -137,7 +137,7 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     return dist;
 }
 
-// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING (LABEL CORRECTING) ---
+// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING CHUAN HOA ---
 vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, int size) {
     int V = graph.V;
 
@@ -215,6 +215,9 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     const int* p_local_weight = local_weight.data();
 
     int bucket_step = 0;
+    
+    // Mảng đánh dấu hoạt động để loại bỏ trùng lặp phần tử
+    vector<bool> in_active_list(local_N, false);
 
     // --- VÒNG LẶP CHÍNH CỦA ĐỒNG BỘ PHÂN LÔ (DELTA-STEPPING) ---
     while (true) {
@@ -295,16 +298,26 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                     int local_v = v - start_v;
                     
                     uint32_t new_dist = dist_u + w;
-                    // SỬA LỖI QUAN TRỌNG: Nếu tìm thấy đường đi ngắn hơn, cập nhật và mở khóa trạng thái đã thăm (Allow Re-relaxation)
                     if (new_dist < local_dist[local_v]) {
                         local_dist[local_v] = new_dist;
                         local_visited[local_v] = false; // Đặt lại về false để cho phép duyệt lại tối ưu hơn
                         local_pq.push(pack(new_dist, v)); 
 
+                        // ĐÁNH DẤU TRỄ: Không push ngay vào active list, chỉ đánh dấu trạng thái hoạt động
                         if (new_dist <= threshold) {
-                            local_active.push_back(pack(new_dist, v));
+                            in_active_list[local_v] = true;
                         }
                     }
+                }
+            }
+
+            // GOM LÔ TRỄ: Duyệt qua danh sách đánh dấu để đưa đỉnh hoạt động duy nhất với khoảng cách ngắn nhất vào active list
+            for (int i = 0; i < local_N; ++i) {
+                if (in_active_list[i]) {
+                    if (!local_visited[i]) {
+                        local_active.push_back(pack(local_dist[i], start_v + i));
+                    }
+                    in_active_list[i] = false; // Đặt lại trạng thái cho chu kỳ sau
                 }
             }
         }
