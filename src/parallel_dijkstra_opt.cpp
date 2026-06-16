@@ -14,11 +14,11 @@ const uint32_t INF = 2000000000;
 
 // Định nghĩa kích thước đồ thị thông qua Macro để linh hoạt khi chạy CI/CD và chạy báo cáo thực tế
 #ifndef V_MAX
-#define V_MAX 100000000       // Mặc định: 10 triệu đỉnh cho báo cáo lớn
+#define V_MAX 10000000       // Mặc định: 10 triệu đỉnh cho báo cáo lớn
 #endif
 
 #ifndef E_MAX
-#define E_MAX 1000000000      // Mặc định: 100 triệu cạnh cho báo cáo lớn
+#define E_MAX 100000000      // Mặc định: 100 triệu cạnh cho báo cáo lớn
 #endif
 
 // Kỹ thuật nén khoảng cách (32-bit) và đỉnh (32-bit) vào một số nguyên 64-bit để giảm 50% số cuộc gọi MPI
