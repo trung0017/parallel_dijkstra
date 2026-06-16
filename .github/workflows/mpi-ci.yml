@@ -21,8 +21,9 @@ jobs:
 
     - name: Compile MPI Project (CI Mode)
       run: |
-        # Biên dịch phiên bản giảm tải để hoàn thành kiểm thử nhanh chóng
-        make
+        # Dọn dẹp sạch bản build cũ và biên dịch mới với cờ OpenMP
+        make clean
+        make ci-build
 
     - name: Run Dijkstra Verification (NP = 2)
       run: |
