@@ -22,7 +22,7 @@ jobs:
     - name: Compile MPI Project (CI Mode)
       run: |
         # Biên dịch phiên bản giảm tải để hoàn thành kiểm thử nhanh chóng
-        make ci-build
+        make
 
     - name: Run Dijkstra Verification (NP = 2)
       run: |
