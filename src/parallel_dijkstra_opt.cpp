@@ -203,28 +203,22 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     MPI_Scatterv(global_dist.data(), sendcounts.data(), displs.data(), MPI_UINT32_T,
                  local_dist.data(), local_N, MPI_UINT32_T, 0, MPI_COMM_WORLD);
 
-    // Mỗi tiến trình duy trì mảng khoảng cách toàn cục dist
+    // Mỗi tiến trình duy trì mảng khoảng cách toàn cục dist và mảng đối chiếu prev_dist kích thước V
     vector<uint32_t> dist(V, INF);
-    #pragma omp parallel for
-    for (int i = 0; i < local_N; ++i) {
-        dist[start_v + i] = local_dist[i];
-    }
+    vector<uint32_t> prev_dist(V, INF);
+    
+    dist[source] = 0;
+    prev_dist[source] = 0;
 
-    vector<uint32_t> prev_dist(local_N, INF);
-    if (source >= start_v && source < end_v) {
-        prev_dist[source - start_v] = 0;
-    }
+    // Các mảng hàng đợi hoạt động cục bộ
+    vector<int> active_local(V);
+    vector<int> next_active_local(V);
+    int active_count = 1;
+    active_local[0] = source; // Tất cả tiến trình đều bắt đầu từ đỉnh nguồn
 
-    // Hàng đợi cục bộ và các mảng đánh dấu trạng thái hàng đợi để loại bỏ trùng lặp
-    vector<int> active_local(local_N);
-    vector<int> next_active_local(local_N);
-    int active_count = 0;
     vector<bool> in_queue(local_N, false);
-
     if (source >= start_v && source < end_v) {
-        active_local[0] = source;
         in_queue[source - start_v] = true;
-        active_count = 1;
     }
 
     const int* p_local_head = local_head.data();
@@ -235,7 +229,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
 
     // --- VÒNG LẶP CHÍNH BULK SYNCHRONOUS SPFA ---
     while (true) {
-        // Pha 1: Tính toán cục bộ song song bằng OpenMP (Hoàn toàn không truyền tin)
+        // Pha 1: Duyệt cạnh cục bộ song song bằng OpenMP (Hoàn toàn không truyền tin)
         while (active_count > 0) {
             int next_active_count = 0;
 
@@ -256,7 +250,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
 
                         if (dist[u] + w < dist[local_v]) {
                             #pragma omp atomic write
-                            dist[v] = dist[u] + w;
+                            dist[local_v] = dist[u] + w;
 
                             if (!in_queue[local_v]) {
                                 in_queue[local_v] = true;
@@ -274,32 +268,36 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                 }
             }
 
-            // Giải phóng trạng thái đánh dấu hàng đợi
+            // Giải phóng trạng thái đánh dấu hàng đợi cục bộ
             #pragma omp parallel for
             for (int i = 0; i < active_count; ++i) {
-                int local_u = active_local[i] - start_v;
-                in_queue[local_u] = false;
+                int u = active_local[i];
+                if (u >= start_v && u < end_v) {
+                    in_queue[u - start_v] = false;
+                }
             }
 
             active_local.swap(next_active_local);
             active_count = next_active_count;
         }
 
-        // Pha 2: Đồng bộ hóa định kỳ mảng khoảng cách tại chỗ giữa các Processes dùng MPI_IN_PLACE
+        // Pha 2: Đồng bộ hóa toàn bộ mảng khoảng cách dist trên toàn cụm máy tính
         MPI_Allreduce(MPI_IN_PLACE, dist.data(), V, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
 
-        // Pha 3: Kiểm tra các cập nhật để nạp lại vào hàng đợi hoạt động cục bộ
+        // Pha 3: Kiểm tra các cập nhật toàn cục mới và nạp vào active_local cho pha sau
         active_count = 0;
         #pragma omp parallel
         {
             vector<int> private_active;
             #pragma omp for nowait
-            for (int i = 0; i < local_N; ++i) {
-                int u = start_v + i;
-                if (dist[u] < prev_dist[i]) {
-                    prev_dist[i] = dist[u];
+            for (int u = 0; u < V; ++u) {
+                if (dist[u] < prev_dist[u]) {
+                    prev_dist[u] = dist[u];
                     private_active.push_back(u);
-                    in_queue[i] = true;
+                    
+                    if (u >= start_v && u < end_v) {
+                        in_queue[u - start_v] = true;
+                    }
                 }
             }
 
@@ -317,7 +315,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         MPI_Allreduce(&local_active_flag, &global_active_flag, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
         if (global_active_flag == 0) {
-            break; 
+            break;
         }
 
         if (rank == 0 && sync_step % 10 == 0) {
@@ -327,7 +325,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         sync_step++;
     }
 
-    // Sao chép khoảng cách kết quả về mảng local_dist để chuẩn bị thu gom
+    // Thu thập kết quả mảng khoảng cách cục bộ để chuẩn bị Gatherv
     #pragma omp parallel for
     for (int i = 0; i < local_N; ++i) {
         local_dist[i] = dist[start_v + i];
