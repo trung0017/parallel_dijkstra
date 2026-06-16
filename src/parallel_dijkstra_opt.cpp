@@ -12,12 +12,15 @@ using namespace std;
 const uint32_t INF = 2000000000; 
 
 #ifndef V_MAX
-#define V_MAX 10000000       
+#define V_MAX 10000000       // Mặc định: 10 triệu đỉnh cho báo cáo lớn
 #endif
 
 #ifndef E_MAX
-#define E_MAX 100000000      
+#define E_MAX 100000000      // Mặc định: 100 triệu cạnh cho báo cáo lớn
 #endif
+
+// Hằng số độ rộng phân lô delta (Có thể điều chỉnh để tối ưu hóa hiệu năng)
+const uint32_t DELTA = 50000; 
 
 inline uint64_t pack(uint32_t dist, uint32_t vertex) {
     return ((uint64_t)dist << 32) | vertex;
@@ -134,7 +137,7 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     return dist;
 }
 
-// --- PARALLEL DIJKSTRA VOI TARGET-PARTITIONED CSR ---
+// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING ---
 vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, int size) {
     int V = graph.V;
 
@@ -153,12 +156,11 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     int start_v = displs[rank];
     int end_v = start_v + local_N;
 
-    // --- BUOC TOI UU: TAO DO THI PHAN HOACH THEO TRANG THAI DICH (TARGET-PARTITIONED CSR) ---
+    // Phân hoạch đồ thị theo phân vùng đích (Target-Partitioned CSR) để tối ưu cục bộ
     vector<int> local_head(V + 1, 0);
     vector<int> local_to;
     vector<int> local_weight;
     
-    // Đếm bậc lọc cục bộ
     vector<int> local_degree(V, 0);
     for (int u = 0; u < V; ++u) {
         for (int e = graph.head[u]; e < graph.head[u + 1]; ++e) {
@@ -208,21 +210,21 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         local_pq.push(pack(0, source));
     }
 
-    // Caching con trỏ thô phân hoạch đích cục bộ để tối đa tốc độ CPU Registers
     const int* p_local_head = local_head.data();
     const int* p_local_to = local_to.data();
     const int* p_local_weight = local_weight.data();
 
-    int print_interval = (V >= 10000) ? (V / 10) : 1000;
+    int bucket_step = 0;
 
-    for (int iter = 0; iter < V; ++iter) {
-        uint64_t local_min = pack(INF, 0xFFFFFFFFULL);
-
+    // --- VÒNG LẶP CHÍNH CỦA ĐỒNG BỘ PHÂN LÔ (DELTA-STEPPING) ---
+    while (true) {
+        uint32_t local_min_dist = INF;
+        
+        // Lấy cực tiểu cục bộ chưa duyệt từ Heap
         while (!local_pq.empty()) {
             uint64_t top = local_pq.top();
             uint32_t d, u;
             unpack(top, d, u);
-
             int local_u = u - start_v;
             if (local_visited[local_u]) {
                 local_pq.pop();
@@ -232,51 +234,96 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                 local_pq.pop();
                 continue;
             }
-            local_min = top;
+            local_min_dist = d;
             break;
         }
 
-        uint64_t global_min;
-        MPI_Allreduce(&local_min, &global_min, 1, MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
+        uint32_t global_min_dist;
+        MPI_Allreduce(&local_min_dist, &global_min_dist, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
 
-        uint32_t global_min_dist, global_min_vertex;
-        unpack(global_min, global_min_dist, global_min_vertex);
-
+        // Nếu tất cả các tiến trình không còn đỉnh nào có thể tiếp cận, kết thúc thuật toán
         if (global_min_dist == INF) {
-            break;
+            break; 
         }
 
-        if (global_min_vertex >= start_v && global_min_vertex < end_v) {
-            local_visited[global_min_vertex - start_v] = true;
-            if (!local_pq.empty()) {
-                local_pq.pop(); 
+        // Định nghĩa giới hạn khoảng cách của lô hiện tại (Threshold)
+        uint32_t threshold = global_min_dist + DELTA;
+
+        // Mảng theo dõi các đỉnh đã được đưa vào lô hiện tại để tránh đưa trùng lặp
+        vector<bool> in_active_bucket(local_N, false);
+        
+        // Gom các đỉnh cục bộ thỏa mãn d <= threshold vào cụm hoạt động ban đầu
+        vector<uint64_t> local_active;
+        for (int i = 0; i < local_N; ++i) {
+            if (!local_visited[i] && local_dist[i] <= threshold) {
+                local_active.push_back(pack(local_dist[i], start_v + i));
+                in_active_bucket[i] = true;
             }
         }
 
-        // DUYỆT CẠNH TỐI ƯU: Chỉ lặp qua các cạnh thực sự hướng tới phân vùng của tiến trình này
-        int edge_start = p_local_head[global_min_vertex];
-        int edge_end = p_local_head[global_min_vertex + 1];
-        for (int e = edge_start; e < edge_end; ++e) {
-            int v = p_local_to[e];
-            int w = p_local_weight[e];
-            
-            int local_v = v - start_v;
-            // Không cần phép kiểm tra biên vì toàn bộ đỉnh v ở đây đã được lọc sẵn nằm trong phân vùng
-            if (!local_visited[local_v]) {
-                uint32_t new_dist = global_min_dist + w;
-                if (new_dist < local_dist[local_v]) {
-                    local_dist[local_v] = new_dist;
-                    local_pq.push(pack(new_dist, v));
+        // Vòng lặp con: duyệt và relax cạnh cho các đỉnh thuộc lô hiện tại cho đến khi hội tụ
+        while (true) {
+            int local_size = local_active.size();
+            vector<int> recvcounts(size);
+            MPI_Allgather(&local_size, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+
+            vector<int> displs(size);
+            int total_active = 0;
+            for (int i = 0; i < size; ++i) {
+                displs[i] = total_active;
+                total_active += recvcounts[i];
+            }
+
+            // Nếu toàn hệ thống không còn đỉnh nào hoạt động trong lô này, chuyển sang lô tiếp theo
+            if (total_active == 0) {
+                break;
+            }
+
+            vector<uint64_t> global_active(total_active);
+            MPI_Allgatherv(local_active.data(), local_size, MPI_UINT64_T,
+                           global_active.data(), recvcounts.data(), displs.data(), MPI_UINT64_T,
+                           MPI_COMM_WORLD);
+
+            local_active.clear();
+
+            // Relax các cạnh của toàn bộ các đỉnh hoạt động trong cụm hiện tại
+            for (int i = 0; i < total_active; ++i) {
+                uint32_t dist_u, u;
+                unpack(global_active[i], dist_u, u);
+
+                if (u >= start_v && u < end_v) {
+                    local_visited[u - start_v] = true;
+                }
+
+                int edge_start = p_local_head[u];
+                int edge_end = p_local_head[u + 1];
+                for (int e = edge_start; e < edge_end; ++e) {
+                    int v = p_local_to[e];
+                    int w = p_local_weight[e];
+                    int local_v = v - start_v;
+                    if (!local_visited[local_v]) {
+                        uint32_t new_dist = dist_u + w;
+                        if (new_dist < local_dist[local_v]) {
+                            local_dist[local_v] = new_dist;
+                            local_pq.push(pack(new_dist, v)); 
+
+                            // Nếu đỉnh lân cận sau khi cập nhật vẫn nhỏ hơn ngưỡng của lô hiện tại,
+                            // đưa nó vào danh sách hoạt động của vòng lặp con tiếp theo
+                            if (new_dist <= threshold && !in_active_bucket[local_v]) {
+                                local_active.push_back(pack(new_dist, v));
+                                in_active_bucket[local_v] = true;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        if (rank == 0 && iter % print_interval == 0) {
-            cout << "[Master] Tien do: " << iter << " / " << V 
-                 << " | Dinh hien tai: " << global_min_vertex 
-                 << " | Chi phi: " << global_min_dist << "\n";
+        if (rank == 0 && bucket_step % 10 == 0) {
+            cout << "[Master] Buoc phan lo " << bucket_step << " | Nguong khoang cach hien tai: " << threshold << "\n";
             cout.flush();
         }
+        bucket_step++;
     }
 
     vector<uint32_t> final_global_dist;
