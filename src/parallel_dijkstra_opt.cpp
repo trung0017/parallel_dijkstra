@@ -19,8 +19,8 @@ const uint32_t INF = 2000000000;
 #define E_MAX 100000000      // Mặc định: 100 triệu cạnh cho báo cáo lớn
 #endif
 
-// Hằng số độ rộng phân lô delta (Có thể điều chỉnh để tối ưu hóa hiệu năng)
-const uint32_t DELTA = 50000; 
+// Độ rộng phân lô tối ưu cho đồ thị thưa 10M đỉnh (đường kính nhỏ)
+const uint32_t DELTA = 10; 
 
 inline uint64_t pack(uint32_t dist, uint32_t vertex) {
     return ((uint64_t)dist << 32) | vertex;
@@ -137,7 +137,7 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     return dist;
 }
 
-// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING CHUAN HOA ---
+// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING TOI UU HOA MAO DANH ---
 vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, int size) {
     int V = graph.V;
 
@@ -203,10 +203,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     MPI_Scatterv(global_dist.data(), sendcounts.data(), displs.data(), MPI_UINT32_T,
                  local_dist.data(), local_N, MPI_UINT32_T, 0, MPI_COMM_WORLD);
 
-    // Mảng đánh dấu marker đã duyệt
     vector<bool> local_visited(local_N, false);
-    
-    // Tối ưu hóa tìm cực tiểu bằng Priority Queue
     priority_queue<uint64_t, vector<uint64_t>, greater<uint64_t>> local_pq;
 
     if (source >= start_v && source < end_v) {
@@ -218,11 +215,8 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     const int* p_local_weight = local_weight.data();
 
     int bucket_step = 0;
-    
-    // Mảng đánh dấu hoạt động để loại bỏ trùng lặp phần tử
     vector<bool> in_active_list(local_N, false);
 
-    // Ép kiểu start_v và end_v về uint32_t để loại bỏ hoàn toàn cảnh báo so sánh khác kiểu dấu
     uint32_t u_start_v = static_cast<uint32_t>(start_v);
     uint32_t u_end_v = static_cast<uint32_t>(end_v);
 
@@ -230,6 +224,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     while (true) {
         uint32_t local_min_dist = INF;
         
+        // Tìm cực tiểu của lô mới trong thời gian O(log V) từ Heap cục bộ
         while (!local_pq.empty()) {
             uint64_t top = local_pq.top();
             uint32_t d, u;
@@ -256,11 +251,26 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
 
         uint32_t threshold = global_min_dist + DELTA;
         
-        // Gom các đỉnh cục bộ thỏa mãn d <= threshold vào cụm hoạt động ban đầu
+        // Trích xuất phi tuyến tính các đỉnh thuộc lô hiện tại ra khỏi Heap cục bộ
         vector<uint64_t> local_active;
-        for (int i = 0; i < local_N; ++i) {
-            if (!local_visited[i] && local_dist[i] <= threshold) {
-                local_active.push_back(pack(local_dist[i], start_v + i));
+        while (!local_pq.empty()) {
+            uint64_t top = local_pq.top();
+            uint32_t d, u;
+            unpack(top, d, u);
+            int local_u = u - start_v;
+            if (local_visited[local_u]) {
+                local_pq.pop();
+                continue;
+            }
+            if (d > local_dist[local_u]) {
+                local_pq.pop();
+                continue;
+            }
+            if (d <= threshold) {
+                local_active.push_back(top);
+                local_pq.pop();
+            } else {
+                break; // Vượt quá ngưỡng lô hiện tại, giữ lại trong Heap cho các lô sau
             }
         }
 
@@ -286,9 +296,10 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                            global_active.data(), recvcounts.data(), displs.data(), MPI_UINT64_T,
                            MPI_COMM_WORLD);
 
+            // Tái sử dụng mảng tĩnh để triệt tiêu thời gian cấp phát lại bộ nhớ
             local_active.clear();
 
-            // Relax các cạnh của toàn bộ các đỉnh hoạt động trong cụm hiện tại
+            // Relax các cạnh song song
             for (int i = 0; i < total_active; ++i) {
                 uint32_t dist_u, u;
                 unpack(global_active[i], dist_u, u);
@@ -307,25 +318,23 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                     uint32_t new_dist = dist_u + w;
                     if (new_dist < local_dist[local_v]) {
                         local_dist[local_v] = new_dist;
-                        local_visited[local_v] = false; // Đặt lại về false để cho phép duyệt lại tối ưu hơn
+                        local_visited[local_v] = false; // Reset visited để cho phép sửa nhãn tối ưu
                         local_pq.push(pack(new_dist, v)); 
 
-                        // ĐÁNH DẤU TRỄ: Không push ngay vào active list, chỉ đánh dấu trạng thái hoạt động
-                        if (new_dist <= threshold) {
+                        // ĐÁNH DẤU TRỄ: Chống bùng nổ trùng lặp phần tử trong mảng truyền thông
+                        if (new_dist <= threshold && !in_active_list[local_v]) {
+                            local_active.push_back(pack(new_dist, v));
                             in_active_list[local_v] = true;
                         }
                     }
                 }
             }
 
-            // GOM LÔ TRỄ: Duyệt qua danh sách đánh dấu để đưa đỉnh hoạt động duy nhất với khoảng cách ngắn nhất vào active list
-            for (int i = 0; i < local_N; ++i) {
-                if (in_active_list[i]) {
-                    if (!local_visited[i]) {
-                        local_active.push_back(pack(local_dist[i], start_v + i));
-                    }
-                    in_active_list[i] = false; // Đặt lại trạng thái cho chu kỳ sau
-                }
+            // Dọn dẹp trạng thái đánh dấu với độ phức tạp O(1) Amortized cực nhẹ
+            for (uint64_t packed : local_active) {
+                uint32_t d, u;
+                unpack(packed, d, u);
+                in_active_list[u - start_v] = false;
             }
         }
 
@@ -336,7 +345,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         bucket_step++;
     }
 
-    // Thu thập mảng khoảng cách cuối cùng về Master bằng MPI_Gatherv
+    // Thu thập kết quả mảng khoảng cách cuối cùng về Master bằng MPI_Gatherv
     vector<uint32_t> final_global_dist;
     if (rank == 0) {
         final_global_dist.resize(V);
