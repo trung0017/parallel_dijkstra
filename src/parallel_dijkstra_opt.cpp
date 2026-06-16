@@ -203,7 +203,10 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     MPI_Scatterv(global_dist.data(), sendcounts.data(), displs.data(), MPI_UINT32_T,
                  local_dist.data(), local_N, MPI_UINT32_T, 0, MPI_COMM_WORLD);
 
+    // Mảng đánh dấu marker đã duyệt
     vector<bool> local_visited(local_N, false);
+    
+    // Tối ưu hóa tìm cực tiểu bằng Priority Queue
     priority_queue<uint64_t, vector<uint64_t>, greater<uint64_t>> local_pq;
 
     if (source >= start_v && source < end_v) {
@@ -218,6 +221,10 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     
     // Mảng đánh dấu hoạt động để loại bỏ trùng lặp phần tử
     vector<bool> in_active_list(local_N, false);
+
+    // Ép kiểu start_v và end_v về uint32_t để loại bỏ hoàn toàn cảnh báo so sánh khác kiểu dấu
+    uint32_t u_start_v = static_cast<uint32_t>(start_v);
+    uint32_t u_end_v = static_cast<uint32_t>(end_v);
 
     // --- VÒNG LẶP CHÍNH CỦA ĐỒNG BỘ PHÂN LÔ (DELTA-STEPPING) ---
     while (true) {
@@ -286,7 +293,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                 uint32_t dist_u, u;
                 unpack(global_active[i], dist_u, u);
 
-                if (u >= start_v && u < end_v) {
+                if (u >= u_start_v && u < u_end_v) {
                     local_visited[u - start_v] = true;
                 }
 
@@ -329,14 +336,10 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         bucket_step++;
     }
 
+    // Thu thập mảng khoảng cách cuối cùng về Master bằng MPI_Gatherv
     vector<uint32_t> final_global_dist;
     if (rank == 0) {
         final_global_dist.resize(V);
-    }
-
-    vector<uint32_t> local_dist(local_N);
-    for (int i = 0; i < local_N; ++i) {
-        local_dist[i] = dist[start_v + i];
     }
 
     MPI_Gatherv(local_dist.data(), local_N, MPI_UINT32_T,
