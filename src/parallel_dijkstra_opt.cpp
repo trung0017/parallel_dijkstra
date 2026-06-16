@@ -137,7 +137,7 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     return dist;
 }
 
-// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING ---
+// --- PARALLEL SSSP VOI GIAI THUAT DELTA-STEPPING (LABEL CORRECTING) ---
 vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, int size) {
     int V = graph.V;
 
@@ -156,7 +156,7 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     int start_v = displs[rank];
     int end_v = start_v + local_N;
 
-    // Phân hoạch đồ thị theo phân vùng đích (Target-Partitioned CSR) để tối ưu cục bộ
+    // Phân hoạch đồ thị theo phân vùng đích (Target-Partitioned CSR)
     vector<int> local_head(V + 1, 0);
     vector<int> local_to;
     vector<int> local_weight;
@@ -220,7 +220,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     while (true) {
         uint32_t local_min_dist = INF;
         
-        // Lấy cực tiểu cục bộ chưa duyệt từ Heap
         while (!local_pq.empty()) {
             uint64_t top = local_pq.top();
             uint32_t d, u;
@@ -241,23 +240,17 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         uint32_t global_min_dist;
         MPI_Allreduce(&local_min_dist, &global_min_dist, 1, MPI_UINT32_T, MPI_MIN, MPI_COMM_WORLD);
 
-        // Nếu tất cả các tiến trình không còn đỉnh nào có thể tiếp cận, kết thúc thuật toán
         if (global_min_dist == INF) {
             break; 
         }
 
-        // Định nghĩa giới hạn khoảng cách của lô hiện tại (Threshold)
         uint32_t threshold = global_min_dist + DELTA;
-
-        // Mảng theo dõi các đỉnh đã được đưa vào lô hiện tại để tránh đưa trùng lặp
-        vector<bool> in_active_bucket(local_N, false);
         
         // Gom các đỉnh cục bộ thỏa mãn d <= threshold vào cụm hoạt động ban đầu
         vector<uint64_t> local_active;
         for (int i = 0; i < local_N; ++i) {
             if (!local_visited[i] && local_dist[i] <= threshold) {
                 local_active.push_back(pack(local_dist[i], start_v + i));
-                in_active_bucket[i] = true;
             }
         }
 
@@ -274,7 +267,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                 total_active += recvcounts[i];
             }
 
-            // Nếu toàn hệ thống không còn đỉnh nào hoạt động trong lô này, chuyển sang lô tiếp theo
             if (total_active == 0) {
                 break;
             }
@@ -301,18 +293,16 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
                     int v = p_local_to[e];
                     int w = p_local_weight[e];
                     int local_v = v - start_v;
-                    if (!local_visited[local_v]) {
-                        uint32_t new_dist = dist_u + w;
-                        if (new_dist < local_dist[local_v]) {
-                            local_dist[local_v] = new_dist;
-                            local_pq.push(pack(new_dist, v)); 
+                    
+                    uint32_t new_dist = dist_u + w;
+                    // SỬA LỖI QUAN TRỌNG: Nếu tìm thấy đường đi ngắn hơn, cập nhật và mở khóa trạng thái đã thăm (Allow Re-relaxation)
+                    if (new_dist < local_dist[local_v]) {
+                        local_dist[local_v] = new_dist;
+                        local_visited[local_v] = false; // Đặt lại về false để cho phép duyệt lại tối ưu hơn
+                        local_pq.push(pack(new_dist, v)); 
 
-                            // Nếu đỉnh lân cận sau khi cập nhật vẫn nhỏ hơn ngưỡng của lô hiện tại,
-                            // đưa nó vào danh sách hoạt động của vòng lặp con tiếp theo
-                            if (new_dist <= threshold && !in_active_bucket[local_v]) {
-                                local_active.push_back(pack(new_dist, v));
-                                in_active_bucket[local_v] = true;
-                            }
+                        if (new_dist <= threshold) {
+                            local_active.push_back(pack(new_dist, v));
                         }
                     }
                 }
