@@ -9,30 +9,25 @@
 
 using namespace std;
 
-// Khoảng cách vô cùng tối ưu cho kiểu uint32_t (tránh tràn số khi cộng trọng số)
 const uint32_t INF = 2000000000; 
 
-// Định nghĩa kích thước đồ thị thông qua Macro
 #ifndef V_MAX
-#define V_MAX 10000000       // Mặc định: 10 triệu đỉnh cho báo cáo lớn
+#define V_MAX 10000000       
 #endif
 
 #ifndef E_MAX
-#define E_MAX 100000000      // Mặc định: 100 triệu cạnh cho báo cáo lớn
+#define E_MAX 100000000      
 #endif
 
-// Nén khoảng cách (32-bit) và đỉnh (32-bit) vào một số nguyên 64-bit để tối ưu hóa truyền tin
 inline uint64_t pack(uint32_t dist, uint32_t vertex) {
     return ((uint64_t)dist << 32) | vertex;
 }
 
-// Giải nén số nguyên 64-bit thành khoảng cách và đỉnh tương ứng
 inline void unpack(uint64_t packed, uint32_t& dist, uint32_t& vertex) {
     dist = packed >> 32;
     vertex = packed & 0xFFFFFFFFULL;
 }
 
-// Bộ sinh số ngẫu nhiên Xorshift64 đồng nhất nhanh trên các tiến trình
 struct FastRand {
     uint64_t state;
     FastRand(uint64_t seed) : state(seed) {}
@@ -47,7 +42,6 @@ struct FastRand {
     }
 };
 
-// Cấu trúc đồ thị CSR phẳng tối ưu bộ nhớ đệm (Cache-friendly)
 struct CSRGraph {
     int V;
     int E;
@@ -64,13 +58,10 @@ struct CSRGraph {
 
         FastRand rand(seed);
 
-        // Đếm bậc của các đỉnh để xây dựng mảng head
         vector<int> degree(V, 0);
-        // 1. Đảm bảo tính liên thông bằng đồ thị đường thẳng
         for (int i = 0; i < V - 1; ++i) {
             degree[i]++;
         }
-        // 2. Sinh ngẫu nhiên các cạnh còn lại
         int remaining = E - (V - 1);
         vector<pair<int, int>> temp_edges;
         temp_edges.reserve(remaining);
@@ -81,16 +72,13 @@ struct CSRGraph {
             temp_edges.push_back({u, v});
         }
 
-        // Tạo mảng head bằng tổng tích lũy
         head[0] = 0;
         for (int i = 0; i < V; ++i) {
             head[i+1] = head[i] + degree[i];
         }
 
-        // Mảng tạm lưu vị trí chèn hiện tại của từng đỉnh
         vector<int> current_pos = head;
 
-        // Điền dữ liệu cạnh vào các mảng phẳng liên tục
         for (int i = 0; i < V - 1; ++i) {
             int u = i;
             int v = i + 1;
@@ -110,7 +98,7 @@ struct CSRGraph {
     }
 };
 
-// --- PHIÊN BẢN TUẦN TỰ ĐÃ TỐI ƯU CON TRỎ THÔ (SEQUENTIAL DIJKSTRA) ---
+// --- SEQUENTIAL DIJKSTRA ---
 vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     int V = graph.V;
     vector<uint32_t> dist(V, INF);
@@ -119,7 +107,6 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     dist[source] = 0;
     pq.push(pack(0, source));
 
-    // Caching con trỏ thô để CPU tối ưu thanh ghi
     const int* graph_head = graph.head.data();
     const int* graph_to = graph.to.data();
     const int* graph_weight = graph.weight.data();
@@ -147,11 +134,10 @@ vector<uint32_t> dijkstra_sequential(const CSRGraph& graph, int source) {
     return dist;
 }
 
-// --- PHIÊN BẢN SONG SONG MPI TỐI ƯU VƯỢT BẬC (PARALLEL DIJKSTRA) ---
+// --- PARALLEL DIJKSTRA VOI TARGET-PARTITIONED CSR ---
 vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, int size) {
     int V = graph.V;
 
-    // Phân chia cân bằng tải các đỉnh cho các tiến trình
     vector<int> sendcounts(size);
     vector<int> displs(size);
     int chunk = V / size;
@@ -167,6 +153,43 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
     int start_v = displs[rank];
     int end_v = start_v + local_N;
 
+    // --- BUOC TOI UU: TAO DO THI PHAN HOACH THEO TRANG THAI DICH (TARGET-PARTITIONED CSR) ---
+    vector<int> local_head(V + 1, 0);
+    vector<int> local_to;
+    vector<int> local_weight;
+    
+    // Đếm bậc lọc cục bộ
+    vector<int> local_degree(V, 0);
+    for (int u = 0; u < V; ++u) {
+        for (int e = graph.head[u]; e < graph.head[u + 1]; ++e) {
+            int v = graph.to[e];
+            if (v >= start_v && v < end_v) {
+                local_degree[u]++;
+            }
+        }
+    }
+
+    local_head[0] = 0;
+    for (int i = 0; i < V; ++i) {
+        local_head[i + 1] = local_head[i] + local_degree[i];
+    }
+
+    local_to.resize(local_head[V]);
+    local_weight.resize(local_head[V]);
+
+    vector<int> local_pos = local_head;
+    for (int u = 0; u < V; ++u) {
+        for (int e = graph.head[u]; e < graph.head[u + 1]; ++e) {
+            int v = graph.to[e];
+            int w = graph.weight[e];
+            if (v >= start_v && v < end_v) {
+                int pos = local_pos[u]++;
+                local_to[pos] = v;
+                local_weight[pos] = w;
+            }
+        }
+    }
+
     // Khởi tạo mảng khoảng cách toàn cục trên Master
     vector<uint32_t> global_dist;
     if (rank == 0) {
@@ -174,7 +197,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         global_dist[source] = 0;
     }
 
-    // 1. Sử dụng MPI_Scatterv để phân phối trạng thái ban đầu
     vector<uint32_t> local_dist(local_N);
     MPI_Scatterv(global_dist.data(), sendcounts.data(), displs.data(), MPI_UINT32_T,
                  local_dist.data(), local_N, MPI_UINT32_T, 0, MPI_COMM_WORLD);
@@ -186,17 +208,16 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         local_pq.push(pack(0, source));
     }
 
-    // Caching con trỏ thô của đồ thị để tối ưu hóa tốc độ truy xuất RAM
-    const int* graph_head = graph.head.data();
-    const int* graph_to = graph.to.data();
-    const int* graph_weight = graph.weight.data();
+    // Caching con trỏ thô phân hoạch đích cục bộ để tối đa tốc độ CPU Registers
+    const int* p_local_head = local_head.data();
+    const int* p_local_to = local_to.data();
+    const int* p_local_weight = local_weight.data();
 
     int print_interval = (V >= 10000) ? (V / 10) : 1000;
 
     for (int iter = 0; iter < V; ++iter) {
         uint64_t local_min = pack(INF, 0xFFFFFFFFULL);
 
-        // Tìm kiếm cực tiểu cục bộ
         while (!local_pq.empty()) {
             uint64_t top = local_pq.top();
             uint32_t d, u;
@@ -216,8 +237,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         }
 
         uint64_t global_min;
-        
-        // TỐI ƯU HÓA ĐẶC BIỆT: Thay thế đồng thời cả Gather và Bcast bằng 1 bước Allreduce duy nhất dùng toán tử MPI_MIN
         MPI_Allreduce(&local_min, &global_min, 1, MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
 
         uint32_t global_min_dist, global_min_vertex;
@@ -227,7 +246,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
             break;
         }
 
-        // TỐI ƯU HÓA: Đánh dấu đã duyệt và loại bỏ ngay lập tức đỉnh được chọn ra khỏi Heap cục bộ
         if (global_min_vertex >= start_v && global_min_vertex < end_v) {
             local_visited[global_min_vertex - start_v] = true;
             if (!local_pq.empty()) {
@@ -235,25 +253,24 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
             }
         }
 
-        // Cập nhật khoảng cách cục bộ cho các lân cận của đỉnh vừa duyệt (Sử dụng con trỏ thô đã cache)
-        int edge_start = graph_head[global_min_vertex];
-        int edge_end = graph_head[global_min_vertex + 1];
+        // DUYỆT CẠNH TỐI ƯU: Chỉ lặp qua các cạnh thực sự hướng tới phân vùng của tiến trình này
+        int edge_start = p_local_head[global_min_vertex];
+        int edge_end = p_local_head[global_min_vertex + 1];
         for (int e = edge_start; e < edge_end; ++e) {
-            int v = graph_to[e];
-            int w = graph_weight[e];
-            if (v >= start_v && v < end_v) {
-                int local_v = v - start_v;
-                if (!local_visited[local_v]) {
-                    uint32_t new_dist = global_min_dist + w;
-                    if (new_dist < local_dist[local_v]) {
-                        local_dist[local_v] = new_dist;
-                        local_pq.push(pack(new_dist, v));
-                    }
+            int v = p_local_to[e];
+            int w = p_local_weight[e];
+            
+            int local_v = v - start_v;
+            // Không cần phép kiểm tra biên vì toàn bộ đỉnh v ở đây đã được lọc sẵn nằm trong phân vùng
+            if (!local_visited[local_v]) {
+                uint32_t new_dist = global_min_dist + w;
+                if (new_dist < local_dist[local_v]) {
+                    local_dist[local_v] = new_dist;
+                    local_pq.push(pack(new_dist, v));
                 }
             }
         }
 
-        // In trạng thái định kỳ giãn cách
         if (rank == 0 && iter % print_interval == 0) {
             cout << "[Master] Tien do: " << iter << " / " << V 
                  << " | Dinh hien tai: " << global_min_vertex 
@@ -262,7 +279,6 @@ vector<uint32_t> dijkstra_parallel(const CSRGraph& graph, int source, int rank, 
         }
     }
 
-    // 2. Sử dụng MPI_Gatherv thu thập kết quả cuối cùng từ các Workers về Master
     vector<uint32_t> final_global_dist;
     if (rank == 0) {
         final_global_dist.resize(V);
