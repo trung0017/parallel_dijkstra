@@ -23,7 +23,11 @@ jobs:
       run: |
         # Dọn dẹp sạch bản build cũ và biên dịch mới với cờ OpenMP
         make clean
-        make ci-build
+        make
+
+    - name: Run Dijkstra Verification (NP = 1)
+      run: |
+        mpirun --oversubscribe -np 1 ./parallel_dijkstra_opt
 
     - name: Run Dijkstra Verification (NP = 2)
       run: |
