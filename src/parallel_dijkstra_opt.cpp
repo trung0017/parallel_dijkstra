@@ -190,11 +190,13 @@
 #include <chrono>
 #include <random>
 #include <iomanip>
+#include <cmath>
+
 using namespace std;
 
 const double INF = 1e18;
-const int V = 100000; 
-const int E = 1000000;
+const int V = 50000;  // Có thể tăng lên khi chạy trên máy mạnh
+const int E = 500000;
 const int SOURCE_NODE = 0;
 
 struct Edge {
@@ -207,11 +209,35 @@ struct DistRank {
     int rank;
 };
 
-// Cấu trúc để truyền tin cập nhật lân cận
+// Cấu trúc tin nhắn để truyền thông tin cập nhật cạnh qua mạng
 struct UpdateMsg {
-    int v;
+    int v_to;
     double new_dist;
 };
+
+// --- HÀM DIJKSTRA TUẦN TỰ ---
+vector<double> dijkstraSequential(int v_count, const vector<vector<Edge>>& adj) {
+    vector<double> dists(v_count, INF);
+    dists[SOURCE_NODE] = 0;
+    priority_queue<pair<double, int>, vector<pair<double, int>>, greater<pair<double, int>>> pq;
+    pq.push({0.0, SOURCE_NODE});
+
+    while (!pq.empty()) {
+        double d = pq.top().first;
+        int u = pq.top().second;
+        pq.pop();
+
+        if (d > dists[u]) continue;
+
+        for (const auto& edge : adj[u]) {
+            if (dists[u] + edge.weight < dists[edge.to]) {
+                dists[edge.to] = dists[u] + edge.weight;
+                pq.push({dists[edge.to], edge.to});
+            }
+        }
+    }
+    return dists;
+}
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
@@ -220,29 +246,51 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // 1. Phân vùng đỉnh (1D Partitioning)
+    // 1. Phân chia vùng đỉnh quản lý (1D Partitioning)
     int local_n = V / size;
     int remainder = V % size;
     int start_v = rank * local_n + min(rank, remainder);
     int end_v = start_v + local_n + (rank < remainder ? 1 : 0);
+    int local_count = end_v - start_v;
 
-    // 2. Sinh đồ thị cục bộ (Chỉ lưu cạnh của các đỉnh mình quản lý)
-    vector<vector<Edge>> local_adj(V); 
+    // 2. Sinh đồ thị (Rank 0 sinh toàn bộ để chạy tuần tự, các Rank khác chỉ sinh phần của mình)
+    vector<vector<Edge>> full_adj;
+    vector<vector<Edge>> local_adj(V); // Chỉ chứa cạnh của các đỉnh thuộc quản lý của rank này
+
     mt19937 gen(42);
     uniform_int_distribution<int> dist_v(0, V - 1);
     uniform_real_distribution<double> dist_w(1.0, 10.0);
+
+    if (rank == 0) full_adj.resize(V);
 
     for (int i = 0; i < E; ++i) {
         int u = dist_v(gen);
         int v = dist_v(gen);
         double w = dist_w(gen);
-        // CHỈ LƯU nêú u thuộc quyền quản lý của Rank này
-        if (u >= start_v && u < end_v && u != v) {
+        if (u == v) continue;
+
+        if (rank == 0) full_adj[u].push_back({v, w});
+        // Phân vùng 1D: Chỉ lưu cạnh nếu đỉnh xuất phát u thuộc rank này
+        if (u >= start_v && u < end_v) {
             local_adj[u].push_back({v, w});
         }
     }
 
-    // 3. Khởi tạo mảng khoảng cách cục bộ cho các đỉnh mình quản lý
+    // --- PHẦN 1: CHẠY TUẦN TỰ (CHỈ RANK 0) ---
+    vector<double> seq_res;
+    double seq_time = 0;
+    if (rank == 0) {
+        cout << "--- DIJKSTRA MPI 1D PARTITIONING ---" << endl;
+        cout << "V = " << V << ", E = " << E << ", NP = " << size << endl;
+        auto s_start = chrono::high_resolution_clock::now();
+        seq_res = dijkstraSequential(V, full_adj);
+        auto s_end = chrono::high_resolution_clock::now();
+        seq_time = chrono::duration<double>(s_end - s_start).count();
+        cout << "Thoi gian tuan tu: " << fixed << setprecision(4) << seq_time << " giay" << endl;
+        full_adj.clear(); // Giải phóng bộ nhớ cho Rank 0
+    }
+
+    // --- PHẦN 2: CHẠY SONG SONG (MPI) ---
     vector<double> local_dists(V, INF);
     vector<bool> local_visited(V, false);
     priority_queue<pair<double, int>, vector<pair<double, int>>, greater<pair<double, int>>> pq;
@@ -252,12 +300,9 @@ int main(int argc, char** argv) {
         pq.push({0.0, SOURCE_NODE});
     }
 
-    if (rank == 0) cout << "--- DIJKSTRA MPI 1D PARTITIONING ---" << endl;
-
     MPI_Barrier(MPI_COMM_WORLD);
     auto p_start = chrono::high_resolution_clock::now();
 
-    // 4. Vòng lặp Dijkstra
     for (int count = 0; count < V; ++count) {
         DistRank local_min = {INF, rank};
         while (!pq.empty()) {
@@ -268,56 +313,76 @@ int main(int argc, char** argv) {
         }
 
         DistRank global_min;
-        // Tìm đỉnh có khoảng cách nhỏ nhất trên toàn mạng lưới
         MPI_Allreduce(&local_min, &global_min, 1, MPI_DOUBLE_INT, MPI_MINLOC, MPI_COMM_WORLD);
 
         if (global_min.dist >= INF) break;
 
-        // Xác định u_global
         int u_global;
         vector<UpdateMsg> updates;
 
+        // Rank nắm giữ đỉnh u_global sẽ chuẩn bị danh sách cạnh để gửi
         if (rank == global_min.rank) {
             u_global = pq.top().second;
             pq.pop();
-            local_visited[u_global] = true;
-            // Chuẩn bị các bản tin cập nhật cho lân cận của u
             for (auto& edge : local_adj[u_global]) {
                 updates.push_back({edge.to, global_min.dist + edge.weight});
             }
         }
 
-        // Broadcast ID của đỉnh u_global
+        // Thông báo cho mọi rank biết đỉnh nào vừa được chốt
         MPI_Bcast(&u_global, 1, MPI_INT, global_min.rank, MPI_COMM_WORLD);
-        // Broadcast số lượng lân cận cần cập nhật
+        local_visited[u_global] = true;
+
+        // Broadcast số lượng cạnh và danh sách cạnh của u_global
         int num_updates = updates.size();
         MPI_Bcast(&num_updates, 1, MPI_INT, global_min.rank, MPI_COMM_WORLD);
-        
-        // Gửi danh sách lân cận để các Rank khác cập nhật nếu họ quản lý đỉnh đó
         if (num_updates > 0) {
-            updates.resize(num_updates);
+            if (rank != global_min.rank) updates.resize(num_updates);
             MPI_Bcast(updates.data(), num_updates * sizeof(UpdateMsg), MPI_BYTE, global_min.rank, MPI_COMM_WORLD);
-            
+
             for (const auto& up : updates) {
-                // Chỉ cập nhật nếu đỉnh 'v' thuộc Rank này
-                if (up.v >= start_v && up.v < end_v) {
-                    if (!local_visited[up.v] && up.new_dist < local_dists[up.v]) {
-                        local_dists[up.v] = up.new_dist;
-                        pq.push({local_dists[up.v], up.v});
+                // Chỉ rank quản lý đỉnh 'up.v_to' mới thực hiện cập nhật
+                if (up.v_to >= start_v && up.v_to < end_v) {
+                    if (!local_visited[up.v_to] && up.new_dist < local_dists[up.v_to]) {
+                        local_dists[up.v_to] = up.new_dist;
+                        pq.push({local_dists[up.v_to], up.v_to});
                     }
                 }
             }
         }
-        // Đánh dấu visited toàn cục (mọi rank đều biết u_global đã xong)
-        local_visited[u_global] = true; 
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto p_end = chrono::high_resolution_clock::now();
+    double par_time = chrono::duration<double>(p_end - p_start).count();
+
+    // --- PHẦN 3: THU THẬP VÀ KIỂM TRA KẾT QUẢ ---
+    vector<double> final_par_dist;
+    if (rank == 0) final_par_dist.resize(V);
+
+    vector<int> counts(size), displs(size);
+    for (int i = 0; i < size; ++i) {
+        counts[i] = V / size + (i < (V % size) ? 1 : 0);
+        displs[i] = (i == 0) ? 0 : displs[i - 1] + counts[i - 1];
+    }
+
+    // Thu thập phần dist mà mỗi rank quản lý về Rank 0
+    MPI_Gatherv(&local_dists[start_v], local_count, MPI_DOUBLE,
+                rank == 0 ? final_par_dist.data() : nullptr,
+                counts.data(), displs.data(), MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
     if (rank == 0) {
-        double par_time = chrono::duration<double>(p_end - p_start).count();
-        cout << "Thoi gian song song (1D Partitioning): " << par_time << " giay" << endl;
+        cout << "Thoi gian song song: " << par_time << " giay" << endl;
+        cout << "Speedup: " << seq_time / par_time << "x" << endl;
+
+        cout << "\nKiem tra 10 dinh dau tien (Node: Tuan tu | Song song):" << endl;
+        bool match = true;
+        for (int i = 0; i < min(10, V); ++i) {
+            cout << "Node " << i << ": " << setw(8) << seq_res[i] << " | " << setw(8) << final_par_dist[i] << endl;
+            if (abs(seq_res[i] - final_par_dist[i]) > 1e-6) match = false;
+        }
+        if (match) cout << "\n=> KET QUA CHINH XAC!" << endl;
+        else cout << "\n=> KET QUA SAI LECH!" << endl;
     }
 
     MPI_Finalize();
