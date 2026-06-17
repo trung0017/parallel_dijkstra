@@ -403,8 +403,8 @@
 using namespace std;
 
 const double INF = 1e18;
-const int V = 30000;  // Giảm V để quan sát sự khác biệt rõ hơn
-const int E = 300000;
+const int V = 300000;  // Giảm V để quan sát sự khác biệt rõ hơn
+const int E = 3000000;
 const int SOURCE_NODE = 0;
 
 struct Edge {
