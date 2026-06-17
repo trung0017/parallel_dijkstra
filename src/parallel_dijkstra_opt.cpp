@@ -9,32 +9,33 @@
 
 using namespace std;
 
-const long long INF = numeric_limits<long long>::max();
-const int V = 1000000;      // Giảm xuống 1 triệu để test, 10 triệu cần RAM rất lớn
-const int E = 10000000;     
+// Sử dụng double để tương thích với MPI_DOUBLE_INT
+const double INF = 1e18; 
+const int V = 100000;      // Giảm xuống để chạy nhanh trên GitHub Actions
+const int E = 1000000;     
 const int SOURCE_NODE = 0;
 
 struct Edge {
     int to;
-    long long weight;
+    double weight;
 };
 
-// Cấu trúc để dùng với MPI_MINLOC
-struct {
-    long long dist;
+// Struct bắt buộc phải là {double, int} để dùng MPI_DOUBLE_INT
+struct DistRank {
+    double dist;
     int rank;
-} local_min, global_min;
+};
 
-void generateGraph(vector<vector<Edge>>& adj, int v_count, int e_count) {
-    adj.resize(v_count);
+void generateGraph(vector<vector<Edge>>& adj) {
+    adj.assign(V, vector<Edge>());
     mt19937 gen(42);
-    uniform_int_distribution<int> dist_v(0, v_count - 1);
-    uniform_int_distribution<long long> dist_w(1, 100);
+    uniform_int_distribution<int> dist_v(0, V - 1);
+    uniform_real_distribution<double> dist_w(1.0, 100.0);
 
-    for (int i = 0; i < e_count; ++i) {
+    for (int i = 0; i < E; ++i) {
         int u = dist_v(gen);
         int v = dist_v(gen);
-        long long w = dist_w(gen);
+        double w = dist_w(gen);
         if (u != v) {
             adj[u].push_back({v, w});
         }
@@ -50,73 +51,69 @@ int main(int argc, char** argv) {
 
     if (rank == 0) cout << "--- DIJKSTRA MPI OPTIMIZED ---" << endl;
 
-    // 1. Khởi tạo đồ thị
     vector<vector<Edge>> adj;
-    generateGraph(adj, V, E);
+    generateGraph(adj);
 
-    // 2. Chia vùng quản lý đỉnh
     int local_n = V / size;
     int remainder = V % size;
     int start_v = rank * local_n + min(rank, remainder);
-    int end_v = start_v + (V / size) + (rank < remainder ? 1 : 0);
+    int end_v = start_v + local_n + (rank < remainder ? 1 : 0);
 
-    vector<long long> local_dist(V, INF); // Lưu khoảng cách tới mọi đỉnh nhưng chỉ cập nhật vùng mình quản lý
-    vector<bool> local_visited(V, false);
+    vector<double> dists(V, INF);
+    vector<bool> visited(V, false);
     
-    // Priority Queue để tìm min cục bộ nhanh: {distance, vertex_id}
-    priority_queue<pair<long long, int>, vector<pair<long long, int>>, greater<pair<long long, int>>> pq;
+    // Priority queue để tìm min local
+    priority_queue<pair<double, int>, vector<pair<double, int>>, greater<pair<double, int>>> pq;
 
     if (SOURCE_NODE >= start_v && SOURCE_NODE < end_v) {
-        local_dist[SOURCE_NODE] = 0;
-        pq.push({0, SOURCE_NODE});
+        dists[SOURCE_NODE] = 0;
+        pq.push({0.0, SOURCE_NODE});
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
     auto start_time = chrono::high_resolution_clock::now();
 
-    // 3. Vòng lặp chính
-    while (true) {
-        // Tìm đỉnh có khoảng cách nhỏ nhất trong vùng quản lý của process này
-        local_min.dist = INF;
-        local_min.rank = rank;
+    // Vòng lặp chính: Tối đa V lần
+    for (int count = 0; count < V; ++count) {
+        DistRank local_min = {INF, rank};
         
+        // Lấy đỉnh có dist nhỏ nhất chưa visited trong vùng quản lý
         while (!pq.empty()) {
             int u = pq.top().second;
-            long long d = pq.top().first;
-            if (d > local_dist[u] || local_visited[u]) {
+            double d = pq.top().first;
+            if (visited[u]) {
                 pq.pop();
                 continue;
             }
             local_min.dist = d;
-            local_min.rank = rank; // Gắn rank để biết ai đang giữ min này
             break;
         }
 
+        DistRank global_min;
         // Tìm min trên toàn bộ các process
-        // MPI_MINLOC trả về giá trị nhỏ nhất và rank của process chứa giá trị đó
         MPI_Allreduce(&local_min, &global_min, 1, MPI_DOUBLE_INT, MPI_MINLOC, MPI_COMM_WORLD);
 
-        if (global_min.dist == INF) break;
+        if (global_min.dist >= INF) break;
 
-        // Xác định đỉnh u được chọn toàn cục
+        // Xác định ID của đỉnh u global
         int u_global;
         if (rank == global_min.rank) {
             u_global = pq.top().second;
             pq.pop();
-            local_visited[u_global] = true;
         }
-        // Broadcast đỉnh u_global để mọi người cùng biết đỉnh nào vừa được "chốt"
+        // Gửi ID đỉnh u_global cho tất cả các process khác
         MPI_Bcast(&u_global, 1, MPI_INT, global_min.rank, MPI_COMM_WORLD);
-        local_visited[u_global] = true;
+        
+        visited[u_global] = true;
 
-        // 4. Relax các cạnh của đỉnh u_global
+        // Relax các cạnh của đỉnh u_global
         for (auto& edge : adj[u_global]) {
             int v = edge.to;
-            // Chỉ process quản lý đỉnh v mới được cập nhật
+            // Chỉ cập nhật nếu đỉnh v thuộc quyền quản lý của rank này
             if (v >= start_v && v < end_v) {
-                if (!local_visited[v] && global_min.dist + edge.weight < local_dist[v]) {
-                    local_dist[v] = global_min.dist + edge.weight;
-                    pq.push({local_dist[v], v});
+                if (!visited[v] && global_min.dist + edge.weight < dists[v]) {
+                    dists[v] = global_min.dist + edge.weight;
+                    pq.push({dists[v], v});
                 }
             }
         }
