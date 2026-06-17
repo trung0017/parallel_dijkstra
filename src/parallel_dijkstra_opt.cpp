@@ -195,8 +195,8 @@
 using namespace std;
 
 const double INF = 1e18;
-const int V = 500000;  // Có thể tăng lên khi chạy trên máy mạnh
-const int E = 5000000;
+const int V = 5000000;  // Có thể tăng lên khi chạy trên máy mạnh
+const int E = 50000000;
 const int SOURCE_NODE = 0;
 
 struct Edge {
